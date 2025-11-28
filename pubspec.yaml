@@ -1,0 +1,20 @@
+name: agent_board
+description: ACP-based coding agent control plane service
+version: 1.0.0
+publish_to: none
+
+environment:
+  sdk: ^3.0.0
+
+dependencies:
+  shelf: ^1.4.1
+  shelf_router: ^1.1.4
+  shelf_web_socket: ^2.0.0
+  web_socket_channel: ^3.0.0
+  uuid: ^4.2.1
+  crypto: ^3.0.3
+
+dev_dependencies:
+  test: ^1.24.9
+  http: ^1.1.0
+  lints: ^3.0.0
