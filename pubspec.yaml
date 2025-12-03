@@ -4,7 +4,7 @@ version: 1.0.0
 publish_to: none
 
 environment:
-  sdk: ^3.0.0
+  sdk: ^3.10.0
 
 dependencies:
   shelf: ^1.4.1
@@ -13,8 +13,12 @@ dependencies:
   web_socket_channel: ^3.0.0
   uuid: ^4.2.1
   crypto: ^3.0.3
+  json_annotation: ^4.8.1
+  mcp_dart: ^1.0.2
 
 dev_dependencies:
   test: ^1.24.9
   http: ^1.1.0
   lints: ^3.0.0
+  build_runner: ^2.4.8
+  json_serializable: ^6.7.1

@@ -138,7 +138,40 @@ claude -p "prompt" --output-format stream-json --include-partial-messages
 | `--verbose` | | Detailed turn-by-turn output |
 | `--json-schema <schema>` | | Validate output against schema |
 
-### 3.3 Event Types
+### 3.3 Input Format (stdin)
+
+Claude Code supports **continuous JSONL streaming** via stdin when using `--input-format stream-json`. This enables true multi-turn conversations within a single process.
+
+**Invocation for continuous streaming:**
+```bash
+claude --output-format stream-json --input-format stream-json
+```
+
+**Input Message Schema:**
+
+User message (send follow-up prompts):
+```json
+{"type":"message","role":"user","content":[{"type":"text","text":"Your follow-up message here"}]}
+```
+
+The input format mirrors the output message format. Each line must be a complete JSON object.
+
+**Multi-turn Flow:**
+1. Spawn process with `--output-format stream-json --input-format stream-json`
+2. Write initial prompt as JSONL to stdin
+3. Read JSONL events from stdout (init, message, tool_use, tool_result, etc.)
+4. When assistant completes a response, write next user message to stdin
+5. Continue until session ends or process is terminated
+
+**Input Message Types:**
+
+| Type | Purpose | Schema |
+|------|---------|--------|
+| `message` | User follow-up | `{"type":"message","role":"user","content":[{"type":"text","text":"..."}]}` |
+
+**Note:** Unlike Codex and Gemini CLIs, Claude Code maintains a persistent connection. Do NOT close stdin after the initial prompt if you intend to send follow-up messages.
+
+### 3.4 Event Types
 
 ```typescript
 type ClaudeStreamEventType =
@@ -463,7 +496,36 @@ codex exec --output-jsonl --full-auto "Your prompt"
 | `resume` | | Resume session subcommand |
 | `--last` | | Resume most recent session |
 
-### 4.3 Event Types
+### 4.3 Input Format (stdin)
+
+Codex CLI does **NOT** support continuous JSONL input streaming. Each invocation processes a single prompt.
+
+**Input mechanism:**
+- Prompt is passed as a command-line argument to `codex exec`
+- Stdin is written with the prompt string, then **immediately closed**
+- For multi-turn, spawn a new process with `--resume <session_id>`
+
+**Single-turn flow:**
+```bash
+codex exec --output-jsonl "Your prompt here"
+```
+
+**Multi-turn flow (process-per-turn):**
+```bash
+# Turn 1: Initial prompt
+codex exec --output-jsonl "Analyze the auth module"
+# Output includes thread_id in thread.started event
+
+# Turn 2: Resume with follow-up
+codex exec --output-jsonl --resume <thread_id> "Now refactor it"
+
+# Turn 3: Continue
+codex exec --output-jsonl --resume <thread_id> "Add tests"
+```
+
+**Key difference from Claude Code:** Codex requires a new process for each turn. The session state is persisted to disk (`~/.codex/sessions/`) and restored via `--resume`.
+
+### 4.4 Event Types
 
 ```typescript
 type CodexEventType =
@@ -777,7 +839,41 @@ gemini -p "prompt" --output-format stream-json -y
 | `--allowed-tools <list>` | | Tool allowlist |
 | `--debug` | `-d` | Enable debug output |
 
-### 5.3 Event Types
+### 5.3 Input Format (stdin)
+
+Gemini CLI does **NOT** support continuous JSONL input streaming. Each invocation processes a single prompt.
+
+**Input mechanism:**
+- Prompt is passed via `-p` flag or piped to stdin as **plain text** (not JSONL)
+- Internal tool loops are handled automatically within a single invocation
+- For multi-turn user conversations, spawn a new process with `--resume`
+
+**Single-turn flow:**
+```bash
+gemini -p "Your prompt here" --output-format stream-json
+```
+
+**Multi-turn flow (process-per-turn):**
+```bash
+# Turn 1: Initial prompt
+gemini -p "Analyze the auth module" --output-format stream-json
+# Session is saved automatically
+
+# Turn 2: Resume with follow-up
+gemini --resume -p "Now refactor it" --output-format stream-json
+
+# Turn 3: Resume specific session by ID
+gemini --resume <session-uuid> -p "Add tests" --output-format stream-json
+```
+
+**Piped input (plain text, not JSONL):**
+```bash
+cat code.py | gemini -p "Review this code" --output-format stream-json
+```
+
+**Key difference from Claude Code:** Gemini requires a new process for each user turn. The session state is persisted to disk (`~/.gemini/tmp/<project>/chats/`) and restored via `--resume`. Stdin accepts plain text only, not JSONL.
+
+### 5.4 Event Types
 
 ```typescript
 type GeminiStreamEventType =
