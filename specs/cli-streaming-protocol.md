@@ -1,8 +1,10 @@
 # CLI Agent Streaming Protocol Specification
 
-**Version:** 2.0.0
+**Version:** 3.0.0
 **Date:** December 3, 2025
 **Purpose:** Comprehensive specification of headless stdio/JSONL streaming protocols for Claude Code, Codex CLI, and Gemini CLI with a unified abstraction layer for Dart client library implementation.
+
+> **Changelog v3.0.0:** Complete event catalog documentation for all CLIs, permission request/response flow documentation, comprehensive event type comparison matrix.
 
 ---
 
@@ -140,13 +142,30 @@ claude -p "prompt" --output-format stream-json --include-partial-messages
 
 ```typescript
 type ClaudeStreamEventType =
-  | "init"         // Session initialization
-  | "message"      // Assistant or user message
-  | "tool_use"     // Tool invocation
+  | "init"         // Session initialization with session_id
+  | "message"      // Assistant or user message content
+  | "tool_use"     // Tool invocation request
   | "tool_result"  // Tool execution result
-  | "result"       // Completion status
+  | "result"       // Session completion status
   | "error"        // Error occurred
-  | "system"       // System message
+  | "system"       // System event (multiple subtypes)
+  | "stream_event" // Raw API streaming delta (--verbose mode only)
+
+// System event subtypes
+type ClaudeSystemSubtype =
+  | "init"             // System initialization info
+  | "compact_boundary" // Context compaction marker
+
+// Message content block types
+type ClaudeContentBlockType =
+  | "text"      // Plain text content
+  | "tool_use"  // Inline tool use reference
+
+// Result status values
+type ClaudeResultStatus =
+  | "success"   // Completed successfully
+  | "error"     // Completed with error
+  | "cancelled" // User cancelled
 ```
 
 ### 3.4 Event Schemas
@@ -234,15 +253,49 @@ type ClaudeStreamEventType =
 }
 ```
 
-#### System Event
+#### System Event (Init Subtype)
+```json
+{
+  "type": "system",
+  "subtype": "init",
+  "version": "1.0.32",
+  "cwd": "/path/to/project",
+  "tools": ["Read", "Edit", "Write", "Bash", "Glob", "Grep"]
+}
+```
+
+#### System Event (Compact Boundary Subtype)
 ```json
 {
   "type": "system",
   "subtype": "compact_boundary",
   "compact_metadata": {
     "trigger": "auto",
-    "pre_tokens": 50000
+    "pre_tokens": 50000,
+    "post_tokens": 25000,
+    "summary_tokens": 500
   }
+}
+```
+
+#### Stream Event (Verbose Mode Only)
+When `--verbose` flag is enabled, raw API streaming deltas are exposed:
+```json
+{
+  "type": "stream_event",
+  "event_type": "content_block_delta",
+  "index": 0,
+  "delta": {
+    "type": "text_delta",
+    "text": "I'll"
+  }
+}
+```
+
+```json
+{
+  "type": "stream_event",
+  "event_type": "message_stop"
 }
 ```
 
@@ -269,13 +322,87 @@ type ClaudeStreamEventType =
 | Allowlist | `--allowedTools "Read,Edit"` | Auto-approve listed tools |
 | Blocklist | `--disallowedTools "Bash"` | Block listed tools |
 | Plan mode | `--permission-mode plan` | Planning only |
+| MCP Delegate | `--permission-prompt-tool <tool>` | Delegate to MCP tool |
 
 **Tool format examples:**
 ```bash
 --allowedTools "Bash(git log:*)" "Bash(git diff:*)" "Read" "Edit"
 ```
 
-### 3.7 Session Management
+### 3.7 Permission Prompt Tool (MCP Delegation)
+
+For headless orchestration, Claude Code supports delegating permission prompts to an external MCP tool via `--permission-prompt-tool <mcp_server_name>__<tool_name>`.
+
+**Invocation:**
+```bash
+claude -p "refactor the code" \
+  --output-format stream-json \
+  --permission-prompt-tool my_server__permission_handler
+```
+
+**How it works:**
+1. When Claude Code needs permission for a tool, it calls the specified MCP tool
+2. The MCP tool receives the permission request as its input
+3. The MCP tool returns a decision (allow/deny)
+4. Claude Code proceeds based on the decision
+
+**Permission Request Input (sent to MCP tool):**
+```json
+{
+  "tool_name": "Edit",
+  "tool_input": {
+    "file_path": "/src/auth.ts",
+    "old_string": "function login()",
+    "new_string": "async function login()"
+  },
+  "context": {
+    "session_id": "sess_abc123",
+    "turn_number": 3,
+    "working_directory": "/path/to/project"
+  }
+}
+```
+
+**Permission Response (returned from MCP tool):**
+
+Allow the tool execution:
+```json
+{
+  "behavior": "allow"
+}
+```
+
+Allow with modified input:
+```json
+{
+  "behavior": "allow",
+  "updatedInput": {
+    "file_path": "/src/auth.ts",
+    "old_string": "function login()",
+    "new_string": "async function login(): Promise<void>"
+  }
+}
+```
+
+Deny the tool execution:
+```json
+{
+  "behavior": "deny",
+  "message": "User policy denies file modifications outside /src directory"
+}
+```
+
+**Behavior values:**
+| Value | Description |
+|-------|-------------|
+| `"allow"` | Permit the tool execution |
+| `"deny"` | Block the tool execution |
+| `"allowAlways"` | Allow this tool for remainder of session |
+| `"denyAlways"` | Deny this tool for remainder of session |
+
+**Note:** When using `--permission-prompt-tool`, no permission events are emitted in the stream. The permission flow is handled entirely through the MCP tool call mechanism. The orchestrating client must implement the MCP server with the permission handling tool.
+
+### 3.8 Session Management
 
 **List sessions:**
 ```bash
@@ -358,14 +485,20 @@ type CodexEventType =
 
 ```typescript
 type CodexItemType =
-  | "agent_message"      // Model text response
-  | "reasoning"          // Internal reasoning
-  | "command_execution"  // Shell command
-  | "file_change"        // File modification
+  | "agent_message"      // Model text response (assistant output)
+  | "reasoning"          // Internal chain-of-thought reasoning
+  | "command_execution"  // Shell command execution
+  | "file_change"        // File create/modify/delete
   | "mcp_tool_call"      // MCP tool invocation
-  | "web_search"         // Web search
-  | "todo_list"          // Task planning
-  | "error"              // Error item
+  | "web_search"         // Web search query and results
+  | "todo_list"          // Task planning list
+  | "error"              // Error during item processing
+
+// Item status values
+type CodexItemStatus =
+  | "success"  // Item completed successfully
+  | "failed"   // Item execution failed
+  | "skipped"  // Item was skipped
 ```
 
 ### 4.5 Event Schemas
@@ -435,6 +568,61 @@ type CodexItemType =
   "tool_name": "database_query",
   "tool_input": {"sql": "SELECT * FROM users"},
   "tool_result": "[{\"id\":1,\"name\":\"Alice\"}]"
+}
+```
+
+#### Item Updated (Reasoning)
+Internal chain-of-thought reasoning (visible in output):
+```json
+{
+  "type": "item.updated",
+  "item_type": "reasoning",
+  "reasoning": "I need to analyze the authentication flow. First, let me check the login function...",
+  "summary": "Analyzing authentication flow"
+}
+```
+
+#### Item Updated (Web Search)
+```json
+{
+  "type": "item.updated",
+  "item_type": "web_search",
+  "query": "typescript async await best practices 2025",
+  "results": [
+    {
+      "title": "Async/Await Best Practices",
+      "url": "https://example.com/article",
+      "snippet": "Modern TypeScript async patterns..."
+    }
+  ]
+}
+```
+
+#### Item Updated (Todo List)
+```json
+{
+  "type": "item.updated",
+  "item_type": "todo_list",
+  "items": [
+    {"id": "1", "task": "Analyze current auth implementation", "status": "completed"},
+    {"id": "2", "task": "Refactor to async/await", "status": "in_progress"},
+    {"id": "3", "task": "Update tests", "status": "pending"}
+  ]
+}
+```
+
+#### Item Updated (Error)
+```json
+{
+  "type": "item.updated",
+  "item_type": "error",
+  "error_type": "execution_failed",
+  "message": "Command exited with non-zero status",
+  "details": {
+    "command": "npm test",
+    "exit_code": 1,
+    "stderr": "Error: Test failed..."
+  }
 }
 ```
 
@@ -529,6 +717,15 @@ network_access = false
 writable_roots = ["/additional/path"]
 ```
 
+**Headless Permission Handling:**
+
+Unlike Claude Code, Codex CLI does **not** emit explicit permission request/response events in the stream. Permission handling is pre-configured via:
+1. Command-line flags (`--full-auto`, `-a`)
+2. Configuration file (`~/.codex/config.toml`)
+3. Sandbox enforcement (blocks disallowed operations)
+
+For fully headless operation, use `--full-auto` to skip all permission prompts. For security-conscious automation, use sandbox modes to restrict capabilities instead of relying on runtime approval.
+
 ### 4.8 Session Storage
 
 **Location:**
@@ -584,11 +781,25 @@ gemini -p "prompt" --output-format stream-json -y
 
 ```typescript
 type GeminiStreamEventType =
-  | "content"     // Text content from model
-  | "tool_call"   // Tool invocation
-  | "result"      // Completion with stats
+  | "content"     // Text content from model (streaming chunks)
+  | "tool_call"   // Tool invocation (atomic, not streamed)
+  | "result"      // Session completion with stats
   | "error"       // Error event
-  | "retry"       // Retry signal
+  | "retry"       // Retry signal on transient failure
+
+// Result status values
+type GeminiResultStatus =
+  | "success"    // Completed successfully
+  | "error"      // Completed with error
+  | "cancelled"  // User cancelled
+
+// Error codes
+type GeminiErrorCode =
+  | "INVALID_CHUNK"     // Malformed stream data
+  | "EXECUTION_FAILED"  // Tool execution failed
+  | "TIMEOUT"           // Operation timed out
+  | "API_ERROR"         // Backend API error
+  | "RATE_LIMIT"        // Rate limit exceeded
 ```
 
 ### 5.4 Event Schemas
@@ -713,6 +924,15 @@ type GeminiStreamEventType =
 }
 ```
 
+**Headless Permission Handling:**
+
+Gemini CLI does **not** emit explicit permission request/response events in the stream. Like Codex, permissions are pre-configured via:
+1. Command-line flags (`-y`, `--auto-edit`, `--approval-mode`)
+2. Settings file trust configuration
+3. Tool include/exclude lists
+
+For fully headless operation, use `-y` (yolo) mode to auto-approve all operations. There is no MCP-based permission delegation mechanism like Claude Code's `--permission-prompt-tool`.
+
 ### 5.7 Session Management
 
 **In-CLI commands:**
@@ -762,20 +982,115 @@ gemini --list-sessions       # List all sessions
 | **YOLO** | `--dangerously-skip-permissions` | `--full-auto` | `-y` / `--yolo` |
 | **Allowlist** | `--allowedTools "Tool1,Tool2"` | (config only) | `--allowed-tools "tool1,tool2"` |
 
-### 6.2 Event Type Mapping
+### 6.2 Complete Event Type Catalog
 
-| Concept | Claude Code | Codex CLI | Gemini CLI |
-|---------|-------------|-----------|------------|
-| **Session start** | `init` | `thread.started` | (first content) |
-| **Turn start** | (implicit) | `turn.started` | (implicit) |
-| **Text output** | `message` (role: assistant) | `item.updated` (agent_message) | `content` |
-| **Tool invocation** | `tool_use` | `item.started/updated` (varies) | `tool_call` |
-| **Tool result** | `tool_result` | `item.completed` | (next content) |
-| **Turn end** | (implicit) | `turn.completed` | (implicit) |
-| **Session end** | `result` | (process exit) | `result` |
-| **Error** | `error` | `error` / `turn.failed` | `error` / `result.status:error` |
+#### Claude Code Events (8 types)
 
-### 6.3 Permission Mode Mapping
+| Event Type | Purpose | Fields | Notes |
+|------------|---------|--------|-------|
+| `init` | Session initialization | `session_id`, `timestamp` | First event emitted |
+| `message` | Text content | `role`, `content[]`, `partial?` | Supports partial streaming |
+| `tool_use` | Tool invocation request | `id`, `name`, `input` | Before tool executes |
+| `tool_result` | Tool execution result | `tool_use_id`, `content`, `is_error` | After tool completes |
+| `result` | Session completion | `status`, `session_id`, `duration_ms` | Final event |
+| `error` | Error occurred | `error.type`, `error.message` | May occur any time |
+| `system` | System event | `subtype`, varies by subtype | Subtypes: `init`, `compact_boundary` |
+| `stream_event` | Raw API delta | `event_type`, `delta`, `index` | Only with `--verbose` |
+
+#### Codex CLI Events (8 types + 8 item types)
+
+**Session/Turn Events:**
+
+| Event Type | Purpose | Fields | Notes |
+|------------|---------|--------|-------|
+| `thread.started` | Session start | `thread_id` | First event emitted |
+| `turn.started` | Turn lifecycle start | (none) | Before items |
+| `turn.completed` | Turn lifecycle end | `usage` | Contains token counts |
+| `turn.failed` | Turn failure | `error.message` | On unrecoverable error |
+| `error` | Session-level error | `message` | May occur any time |
+
+**Item Lifecycle Events:**
+
+| Event Type | Purpose | Fields | Notes |
+|------------|---------|--------|-------|
+| `item.started` | Item begins | `item_type` | Start of item processing |
+| `item.updated` | Item progress | `item_type`, varies | Streaming updates |
+| `item.completed` | Item finished | `item_type`, `status` | End of item processing |
+
+**Item Types (8):**
+
+| Item Type | Purpose | Key Fields in `item.updated` |
+|-----------|---------|------------------------------|
+| `agent_message` | Assistant text | `content` |
+| `reasoning` | Chain-of-thought | `reasoning`, `summary` |
+| `command_execution` | Shell command | `command_line`, `aggregated_output` |
+| `file_change` | File modification | `changes[]` with `path`, `before`, `after` |
+| `mcp_tool_call` | MCP tool | `tool_name`, `tool_input`, `tool_result` |
+| `web_search` | Web search | `query`, `results[]` |
+| `todo_list` | Task planning | `items[]` with `task`, `status` |
+| `error` | Error item | `error_type`, `message`, `details` |
+
+#### Gemini CLI Events (5 types)
+
+| Event Type | Purpose | Fields | Notes |
+|------------|---------|--------|-------|
+| `content` | Text content | `value` | Streaming text chunks |
+| `tool_call` | Tool invocation | `name`, `args` | Atomic (no separate result) |
+| `result` | Session completion | `status`, `stats`, `timestamp`, `error?` | Final event |
+| `error` | Error event | `error.code`, `error.message` | May occur any time |
+| `retry` | Retry signal | `attempt`, `max_attempts`, `delay_ms` | On transient failure |
+
+### 6.3 Comprehensive Event Mapping Matrix
+
+This matrix maps every event type across all three CLIs:
+
+| Semantic Concept | Claude Code | Codex CLI | Gemini CLI |
+|------------------|-------------|-----------|------------|
+| **Session Lifecycle** | | | |
+| Session start | `init` | `thread.started` | (synthetic on first event) |
+| Session end (success) | `result` (status: success) | (process exit 0) | `result` (status: success) |
+| Session end (error) | `result` (status: error) | `turn.failed` | `result` (status: error) |
+| Session end (cancelled) | `result` (status: cancelled) | (SIGTERM) | `result` (status: cancelled) |
+| **Turn Lifecycle** | | | |
+| Turn start | (implicit) | `turn.started` | (implicit) |
+| Turn end | (implicit) | `turn.completed` | (implicit in result) |
+| Turn failed | `error` | `turn.failed` | `error` |
+| **Content Events** | | | |
+| Assistant text (complete) | `message` (partial: false) | `item.completed` (agent_message) | `content` (final) |
+| Assistant text (streaming) | `message` (partial: true) | `item.updated` (agent_message) | `content` (incremental) |
+| User message | `message` (role: user) | - | - |
+| **Tool Lifecycle** | | | |
+| Tool invocation start | `tool_use` | `item.started` (command/mcp/file) | `tool_call` |
+| Tool progress/output | - | `item.updated` | - |
+| Tool completed (success) | `tool_result` (is_error: false) | `item.completed` (status: success) | (implicit in next content) |
+| Tool completed (error) | `tool_result` (is_error: true) | `item.completed` (status: failed) | (error in result) |
+| **Specific Tool Types** | | | |
+| Shell command | `tool_use` (name: Bash) | `item.*` (command_execution) | `tool_call` (name: run_shell) |
+| File read | `tool_use` (name: Read) | `item.*` (command_execution) | `tool_call` (name: read_file) |
+| File write/edit | `tool_use` (name: Edit/Write) | `item.*` (file_change) | `tool_call` (name: write_file) |
+| MCP tool | `tool_use` (name: mcp__*) | `item.*` (mcp_tool_call) | `tool_call` (MCP name) |
+| Web search | `tool_use` (name: WebSearch) | `item.*` (web_search) | `tool_call` (name: google_search) |
+| **Reasoning/Thinking** | | | |
+| Visible reasoning | - | `item.*` (reasoning) | - |
+| Internal thinking | (not exposed) | (summary in reasoning) | (not exposed) |
+| **Task Management** | | | |
+| Todo list | `tool_use` (name: TodoWrite) | `item.*` (todo_list) | - |
+| **System Events** | | | |
+| System init info | `system` (subtype: init) | - | - |
+| Context compaction | `system` (subtype: compact_boundary) | - | - |
+| Verbose/debug | `stream_event` (--verbose) | - | (--debug to stderr) |
+| **Error Handling** | | | |
+| Session error | `error` | `error` | `error` |
+| Tool error | `tool_result` (is_error: true) | `item.*` (error item_type) | `result` (status: error) |
+| Retry signal | - | - | `retry` |
+| **Token/Usage Tracking** | | | |
+| Per-turn usage | - | `turn.completed.usage` | - |
+| Final usage | `result.duration_ms` | `turn.completed.usage` | `result.stats` |
+| **Permission Events** | | | |
+| Permission request | (via MCP tool call) | - | - |
+| Permission response | (via MCP tool result) | - | - |
+
+### 6.4 Permission Mode Mapping
 
 | Behavior | Claude Code | Codex CLI | Gemini CLI |
 |----------|-------------|-----------|------------|
@@ -784,8 +1099,9 @@ gemini --list-sessions       # List all sessions
 | **Auto file edits** | `--allowedTools "Edit,Write"` | - | `auto_edit` |
 | **Auto all** | `--dangerously-skip-permissions` | `--full-auto` | `--yolo` |
 | **Sandbox** | - | `workspace-write` | `--sandbox` |
+| **MCP Permission Delegation** | `--permission-prompt-tool` | - | - |
 
-### 6.4 Feature Comparison
+### 6.5 Feature Comparison
 
 | Feature | Claude Code | Codex CLI | Gemini CLI |
 |---------|-------------|-----------|------------|
@@ -797,8 +1113,9 @@ gemini --list-sessions       # List all sessions
 | **Partial streaming** | `--include-partial-messages` | Built-in (item.updated) | Built-in |
 | **MCP integration** | Yes | Yes | Yes |
 | **Git checkpointing** | No | No | Yes |
+| **Permission delegation** | MCP tool | Config only | Config only |
 
-### 6.5 Event Flow Patterns
+### 6.6 Event Flow Patterns
 
 **Claude Code:**
 ```
@@ -1067,22 +1384,41 @@ class GeminiAdapter implements ProtocolAdapter {
 |--------------|------------------|
 | `type: "init"` | `SessionStartedEvent` |
 | `type: "message"` | `TextChunkEvent` |
+| `type: "message"` (partial: true) | `TextChunkEvent` (isPartial: true) |
 | `type: "tool_use"` | `ToolStartedEvent` |
 | `type: "tool_result"` | `ToolCompletedEvent` |
 | `type: "result"` (success) | `SessionEndedEvent(completed)` |
 | `type: "result"` (error) | `SessionEndedEvent(failed)` |
 | `type: "error"` | `SessionEndedEvent(failed)` |
+| `type: "system"` (subtype: init) | `SystemEvent` (informational, usually ignored) |
+| `type: "system"` (subtype: compact_boundary) | `SystemEvent` (context management) |
+| `type: "stream_event"` | `RawDeltaEvent` (verbose mode only) |
 
 #### From Codex CLI
 | Native Event | Unified Event(s) |
 |--------------|------------------|
 | `thread.started` | `SessionStartedEvent` |
-| `turn.started` | (ignored or synthetic TurnStarted) |
-| `item.started` + `item.updated` (agent_message) | `TextChunkEvent` |
-| `item.started` (command/tool) | `ToolStartedEvent` |
-| `item.updated` (command/tool) | `ToolProgressEvent` |
-| `item.completed` (command/tool) | `ToolCompletedEvent` |
-| `item.*` (file_change) | `FileChangedEvent` |
+| `turn.started` | `TurnStartedEvent` (optional) |
+| `item.started` (agent_message) | `TextChunkEvent` (start) |
+| `item.updated` (agent_message) | `TextChunkEvent` (streaming) |
+| `item.completed` (agent_message) | `TextChunkEvent` (final) |
+| `item.started` (reasoning) | `ReasoningEvent` (start) |
+| `item.updated` (reasoning) | `ReasoningEvent` (streaming) |
+| `item.completed` (reasoning) | `ReasoningEvent` (final) |
+| `item.started` (command_execution) | `ToolStartedEvent` (shell) |
+| `item.updated` (command_execution) | `ToolProgressEvent` (output streaming) |
+| `item.completed` (command_execution) | `ToolCompletedEvent` (shell) |
+| `item.started` (file_change) | `FileChangedEvent` (start) |
+| `item.updated` (file_change) | `FileChangedEvent` (diff details) |
+| `item.completed` (file_change) | `FileChangedEvent` (final) |
+| `item.started` (mcp_tool_call) | `ToolStartedEvent` (MCP) |
+| `item.updated` (mcp_tool_call) | `ToolProgressEvent` (MCP) |
+| `item.completed` (mcp_tool_call) | `ToolCompletedEvent` (MCP) |
+| `item.started` (web_search) | `ToolStartedEvent` (search) |
+| `item.updated` (web_search) | `ToolProgressEvent` (results) |
+| `item.completed` (web_search) | `ToolCompletedEvent` (search) |
+| `item.*` (todo_list) | `TodoListEvent` |
+| `item.*` (error) | `ErrorEvent` |
 | `turn.completed` | `TurnCompletedEvent` |
 | `turn.failed` | `SessionEndedEvent(failed)` |
 | `error` | `SessionEndedEvent(failed)` |
@@ -1093,10 +1429,12 @@ class GeminiAdapter implements ProtocolAdapter {
 |--------------|------------------|
 | (first event) | `SessionStartedEvent` (synthetic) |
 | `type: "content"` | `TextChunkEvent` |
-| `type: "tool_call"` | `ToolStartedEvent` + `ToolCompletedEvent` |
+| `type: "tool_call"` | `ToolStartedEvent` + `ToolCompletedEvent` (atomic) |
 | `type: "result"` (success) | `TurnCompletedEvent` + `SessionEndedEvent(completed)` |
 | `type: "result"` (error) | `SessionEndedEvent(failed)` |
+| `type: "result"` (cancelled) | `SessionEndedEvent(cancelled)` |
 | `type: "error"` | `SessionEndedEvent(failed)` |
+| `type: "retry"` | `RetryEvent` (transient failure handling) |
 
 ---
 
@@ -1350,6 +1688,36 @@ class GeminiAdapter implements ProtocolAdapter {
         }
       },
       "required": ["type", "error"]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "type": { "const": "system" },
+        "subtype": { "enum": ["init", "compact_boundary"] },
+        "version": { "type": "string" },
+        "cwd": { "type": "string" },
+        "tools": { "type": "array", "items": { "type": "string" } },
+        "compact_metadata": {
+          "type": "object",
+          "properties": {
+            "trigger": { "type": "string" },
+            "pre_tokens": { "type": "integer" },
+            "post_tokens": { "type": "integer" },
+            "summary_tokens": { "type": "integer" }
+          }
+        }
+      },
+      "required": ["type", "subtype"]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "type": { "const": "stream_event" },
+        "event_type": { "type": "string" },
+        "index": { "type": "integer" },
+        "delta": { "type": "object" }
+      },
+      "required": ["type", "event_type"]
     }
   ]
 }
@@ -1485,6 +1853,15 @@ class GeminiAdapter implements ProtocolAdapter {
         }
       },
       "required": ["type", "error"]
+    },
+    {
+      "properties": {
+        "type": { "const": "retry" },
+        "attempt": { "type": "integer" },
+        "max_attempts": { "type": "integer" },
+        "delay_ms": { "type": "integer" }
+      },
+      "required": ["type", "attempt"]
     }
   ]
 }
@@ -1721,4 +2098,4 @@ npx @google/gemini-cli
 
 ---
 
-*End of Specification v2.0.0*
+*End of Specification v3.0.0*
