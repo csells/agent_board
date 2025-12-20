@@ -1,9 +1,11 @@
 # CLI Agent Streaming Protocol Specification
 
-**Version:** 3.0.0
+**Version:** 4.0.0
 **Date:** December 3, 2025
 **Purpose:** Comprehensive specification of headless stdio/JSONL streaming protocols for Claude Code, Codex CLI, and Gemini CLI with a unified abstraction layer for Dart client library implementation.
 
+> **Changelog v4.0.0:** Clarified multi-turn architecture patterns - all three CLIs support disk-based session persistence and resume. Updated invocation patterns for Codex and Gemini headless modes with resume capability.
+>
 > **Changelog v3.0.0:** Complete event catalog documentation for all CLIs, permission request/response flow documentation, comprehensive event type comparison matrix.
 
 ---
@@ -31,6 +33,18 @@ All three major AI coding CLI agents support **headless operation via stdio with
 | **Claude Code** | `claude -p "prompt"` | `--output-format stream-json` | JSONL |
 | **Codex CLI** | `codex exec "prompt"` | `--output-jsonl` | JSONL |
 | **Gemini CLI** | `gemini -p "prompt"` | `--output-format stream-json` | JSONL |
+
+### Multi-Turn Architecture Comparison
+
+All three CLIs support **multi-turn conversations with session persistence**, but use different architectural patterns:
+
+| CLI | Process Model | Session Persistence | Multi-Turn Pattern | Session Storage |
+|-----|---------------|--------------------|--------------------|-----------------|
+| **Claude Code** | Long-lived (bidirectional JSONL) | Disk | Send messages to same process via stdin | `~/.claude/sessions/` |
+| **Codex CLI** | Process-per-turn | Disk | Spawn new process with `resume <thread_id>` | `~/.codex/sessions/` |
+| **Gemini CLI** | Process-per-turn | Disk | Spawn new process with `--resume <session_id>` | `~/.gemini/tmp/<project>/chats/` |
+
+**Key insight:** Codex and Gemini use the **same architectural pattern** - spawn a new CLI process for each user turn, with session state persisted to disk and restored via resume flags. Claude Code is unique in supporting true bidirectional JSONL streaming within a single long-lived process.
 
 ### Common Architecture
 
@@ -811,16 +825,31 @@ gemini -p "Your prompt here" --output-format stream-json
 cat file.txt | gemini -p "Analyze this" --output-format stream-json
 ```
 
-**Resume session:**
+**Resume session (combine with -p for headless multi-turn):**
 ```bash
-gemini --resume -p "Continue"
-gemini --resume 1 -p "Continue"  # By index
-gemini --resume <uuid> -p "Continue"  # By ID
+gemini --resume -p "Continue"                    # Resume latest session
+gemini --resume 1 -p "Continue"                  # By index
+gemini --resume <session-uuid> -p "Continue"     # By session ID
 ```
 
 **YOLO mode:**
 ```bash
 gemini -p "prompt" --output-format stream-json -y
+```
+
+**Multi-turn headless flow (process-per-turn):**
+```bash
+# Turn 1: Initial prompt - captures session_id from init event
+gemini -p "Analyze the auth module" --output-format stream-json -y
+# Output: {"type":"init","session_id":"abc123",...}
+# ... more JSONL events ...
+# {"type":"result","status":"success",...}
+
+# Turn 2: Resume with follow-up
+gemini --resume abc123 -p "Now refactor it" --output-format stream-json -y
+
+# Turn 3: Continue session
+gemini --resume abc123 -p "Add comprehensive tests" --output-format stream-json -y
 ```
 
 ### 5.2 CLI Arguments
@@ -841,29 +870,35 @@ gemini -p "prompt" --output-format stream-json -y
 
 ### 5.3 Input Format (stdin)
 
-Gemini CLI does **NOT** support continuous JSONL input streaming. Each invocation processes a single prompt.
+Gemini CLI uses the **same process-per-turn architecture as Codex CLI**. Each invocation processes a single prompt, and multi-turn conversations require spawning new processes with the `--resume` flag.
 
 **Input mechanism:**
 - Prompt is passed via `-p` flag or piped to stdin as **plain text** (not JSONL)
 - Internal tool loops are handled automatically within a single invocation
-- For multi-turn user conversations, spawn a new process with `--resume`
+- Session state is **automatically persisted to disk** after each turn
+- For multi-turn, spawn a new process with `--resume <session_id>`
+
+**Session persistence:**
+- Sessions are automatically saved to `~/.gemini/tmp/<project_hash>/chats/`
+- The `session_id` is emitted in the `init` event at the start of each turn
+- This ID can be used with `--resume` for subsequent turns
 
 **Single-turn flow:**
 ```bash
-gemini -p "Your prompt here" --output-format stream-json
+gemini -p "Your prompt here" --output-format stream-json -y
 ```
 
-**Multi-turn flow (process-per-turn):**
+**Multi-turn flow (process-per-turn, identical pattern to Codex):**
 ```bash
-# Turn 1: Initial prompt
-gemini -p "Analyze the auth module" --output-format stream-json
-# Session is saved automatically
+# Turn 1: Initial prompt - extract session_id from init event
+gemini -p "Analyze the auth module" --output-format stream-json -y
+# Output includes: {"type":"init","session_id":"abc123-def456","model":"gemini-2.0-flash-exp",...}
 
-# Turn 2: Resume with follow-up
-gemini --resume -p "Now refactor it" --output-format stream-json
+# Turn 2: Resume with follow-up (using session_id from Turn 1)
+gemini --resume abc123-def456 -p "Now refactor it" --output-format stream-json -y
 
-# Turn 3: Resume specific session by ID
-gemini --resume <session-uuid> -p "Add tests" --output-format stream-json
+# Turn 3: Continue with same session_id
+gemini --resume abc123-def456 -p "Add tests" --output-format stream-json -y
 ```
 
 **Piped input (plain text, not JSONL):**
@@ -871,14 +906,29 @@ gemini --resume <session-uuid> -p "Add tests" --output-format stream-json
 cat code.py | gemini -p "Review this code" --output-format stream-json
 ```
 
-**Key difference from Claude Code:** Gemini requires a new process for each user turn. The session state is persisted to disk (`~/.gemini/tmp/<project>/chats/`) and restored via `--resume`. Stdin accepts plain text only, not JSONL.
+**Architecture comparison:**
+
+| Aspect | Codex CLI | Gemini CLI |
+|--------|-----------|------------|
+| Process model | Process-per-turn | Process-per-turn |
+| Session persistence | `~/.codex/sessions/` | `~/.gemini/tmp/<project>/chats/` |
+| Resume flag | `resume <thread_id>` | `--resume <session_id>` |
+| Session ID source | `thread.started` event | `init` event |
+| Stdin format | Plain text | Plain text |
+| Output format | JSONL (`--output-jsonl`) | JSONL (`--output-format stream-json`) |
+
+**Key difference from Claude Code:** Both Codex and Gemini require a new process for each user turn, with session state persisted to disk and restored via resume flags. Claude Code is unique in supporting true bidirectional JSONL streaming within a single long-lived process.
 
 ### 5.4 Event Types
 
 ```typescript
 type GeminiStreamEventType =
-  | "content"     // Text content from model (streaming chunks)
-  | "tool_call"   // Tool invocation (atomic, not streamed)
+  | "init"        // Session initialization with session_id and model
+  | "message"     // User/assistant message
+  | "tool_use"    // Tool invocation request
+  | "tool_result" // Tool execution result
+  | "content"     // Text content from model (streaming chunks) - legacy
+  | "tool_call"   // Tool invocation (atomic) - legacy
   | "result"      // Session completion with stats
   | "error"       // Error event
   | "retry"       // Retry signal on transient failure
@@ -898,9 +948,65 @@ type GeminiErrorCode =
   | "RATE_LIMIT"        // Rate limit exceeded
 ```
 
-### 5.4 Event Schemas
+### 5.5 Event Schemas
 
-#### Content Event
+#### Init Event
+The first event emitted - contains session_id for multi-turn resume:
+```json
+{
+  "type": "init",
+  "timestamp": "2025-12-03T10:00:00.000Z",
+  "session_id": "abc123-def456-7890",
+  "model": "gemini-2.0-flash-exp"
+}
+```
+
+#### Message Event (User)
+```json
+{
+  "type": "message",
+  "timestamp": "2025-12-03T10:00:01.000Z",
+  "role": "user",
+  "content": "Analyze the auth module"
+}
+```
+
+#### Message Event (Assistant)
+```json
+{
+  "type": "message",
+  "timestamp": "2025-12-03T10:00:02.000Z",
+  "role": "assistant",
+  "content": "I'll analyze the authentication module...",
+  "delta": true
+}
+```
+
+#### Tool Use Event
+```json
+{
+  "type": "tool_use",
+  "timestamp": "2025-12-03T10:00:03.000Z",
+  "tool_name": "Bash",
+  "tool_id": "bash-123",
+  "parameters": {
+    "command": "ls -la src/auth/"
+  }
+}
+```
+
+#### Tool Result Event
+```json
+{
+  "type": "tool_result",
+  "timestamp": "2025-12-03T10:00:04.000Z",
+  "tool_id": "bash-123",
+  "status": "success",
+  "output": "total 16\n-rw-r--r-- auth.ts\n-rw-r--r-- login.ts"
+}
+```
+
+#### Content Event (legacy format, still supported)
 ```json
 {
   "type": "content",
@@ -908,7 +1014,7 @@ type GeminiErrorCode =
 }
 ```
 
-#### Tool Call Event
+#### Tool Call Event (legacy format, still supported)
 ```json
 {
   "type": "tool_call",
@@ -975,18 +1081,26 @@ type GeminiErrorCode =
 }
 ```
 
-### 5.5 Complete Event Flow Example
+### 5.6 Complete Event Flow Example
 
 ```jsonl
-{"type":"content","value":"I'll analyze the authentication module and refactor it."}
-{"type":"tool_call","name":"read_file","args":{"file_path":"./src/auth.ts"}}
-{"type":"content","value":"I found the login function. Let me make it async..."}
-{"type":"tool_call","name":"write_file","args":{"file_path":"./src/auth.ts","content":"export async function login() {\n  // refactored code\n}"}}
-{"type":"content","value":"Done! I've refactored the login function to be async."}
-{"type":"result","status":"success","stats":{"total_tokens":350,"input_tokens":100,"output_tokens":250,"duration_ms":5000,"tool_calls":2},"timestamp":"2025-12-03T10:30:00Z"}
+{"type":"init","timestamp":"2025-12-03T10:00:00.000Z","session_id":"abc123-def456","model":"gemini-2.0-flash-exp"}
+{"type":"message","role":"user","content":"Analyze and refactor the auth module","timestamp":"2025-12-03T10:00:01.000Z"}
+{"type":"tool_use","tool_name":"Bash","tool_id":"bash-001","parameters":{"command":"cat src/auth.ts"},"timestamp":"2025-12-03T10:00:02.000Z"}
+{"type":"tool_result","tool_id":"bash-001","status":"success","output":"export function login() {...}","timestamp":"2025-12-03T10:00:03.000Z"}
+{"type":"message","role":"assistant","content":"I found the login function. Let me make it async...","delta":true,"timestamp":"2025-12-03T10:00:04.000Z"}
+{"type":"tool_use","tool_name":"write_file","tool_id":"write-001","parameters":{"file_path":"./src/auth.ts","content":"export async function login() {...}"},"timestamp":"2025-12-03T10:00:05.000Z"}
+{"type":"tool_result","tool_id":"write-001","status":"success","timestamp":"2025-12-03T10:00:06.000Z"}
+{"type":"message","role":"assistant","content":"Done! I've refactored the login function to be async.","timestamp":"2025-12-03T10:00:07.000Z"}
+{"type":"result","status":"success","stats":{"total_tokens":350,"input_tokens":100,"output_tokens":250,"duration_ms":5000,"tool_calls":2},"timestamp":"2025-12-03T10:00:08.000Z"}
 ```
 
-### 5.6 Permission Control
+**Note:** The `session_id` from the `init` event (`abc123-def456`) can be used to resume this session:
+```bash
+gemini --resume abc123-def456 -p "Add tests for the login function" --output-format stream-json
+```
+
+### 5.7 Permission Control
 
 **Approval Modes:**
 
@@ -1029,7 +1143,7 @@ Gemini CLI does **not** emit explicit permission request/response events in the 
 
 For fully headless operation, use `-y` (yolo) mode to auto-approve all operations. There is no MCP-based permission delegation mechanism like Claude Code's `--permission-prompt-tool`.
 
-### 5.7 Session Management
+### 5.8 Session Management
 
 **In-CLI commands:**
 ```
@@ -1126,12 +1240,16 @@ gemini --list-sessions       # List all sessions
 | `todo_list` | Task planning | `items[]` with `task`, `status` |
 | `error` | Error item | `error_type`, `message`, `details` |
 
-#### Gemini CLI Events (5 types)
+#### Gemini CLI Events (9 types)
 
 | Event Type | Purpose | Fields | Notes |
 |------------|---------|--------|-------|
-| `content` | Text content | `value` | Streaming text chunks |
-| `tool_call` | Tool invocation | `name`, `args` | Atomic (no separate result) |
+| `init` | Session start | `session_id`, `model`, `timestamp` | First event, contains session ID for resume |
+| `message` | User/assistant message | `role`, `content`, `delta?`, `timestamp` | Supports streaming via delta flag |
+| `tool_use` | Tool invocation request | `tool_name`, `tool_id`, `parameters`, `timestamp` | Before tool executes |
+| `tool_result` | Tool execution result | `tool_id`, `status`, `output?`, `error?`, `timestamp` | After tool completes |
+| `content` | Text content (legacy) | `value` | Streaming text chunks |
+| `tool_call` | Tool invocation (legacy) | `name`, `args` | Atomic (no separate result) |
 | `result` | Session completion | `status`, `stats`, `timestamp`, `error?` | Final event |
 | `error` | Error event | `error.code`, `error.message` | May occur any time |
 | `retry` | Retry signal | `attempt`, `max_attempts`, `delay_ms` | On transient failure |
@@ -1143,7 +1261,7 @@ This matrix maps every event type across all three CLIs:
 | Semantic Concept | Claude Code | Codex CLI | Gemini CLI |
 |------------------|-------------|-----------|------------|
 | **Session Lifecycle** | | | |
-| Session start | `init` | `thread.started` | (synthetic on first event) |
+| Session start | `init` | `thread.started` | `init` |
 | Session end (success) | `result` (status: success) | (process exit 0) | `result` (status: success) |
 | Session end (error) | `result` (status: error) | `turn.failed` | `result` (status: error) |
 | Session end (cancelled) | `result` (status: cancelled) | (SIGTERM) | `result` (status: cancelled) |
@@ -1227,8 +1345,10 @@ turn.completed
 
 **Gemini CLI:**
 ```
-content* → (tool_call → content*)* → result
+init → message* → (tool_use → tool_result)* → message* → result
 ```
+
+**Note:** Gemini CLI's event flow pattern is now nearly identical to Claude Code's. The key difference is the process lifecycle: Claude Code maintains a long-lived bidirectional process, while Gemini uses process-per-turn with session persistence (like Codex).
 
 ---
 
@@ -1463,10 +1583,39 @@ class GeminiAdapter implements ProtocolAdapter {
   AgentEvent? parseEvent(String jsonLine) {
     final json = jsonDecode(jsonLine);
     return switch (json['type']) {
-      'content' => TextChunkEvent(...),
+      // Modern event types
+      'init' => SessionStartedEvent(sessionId: json['session_id'], ...),
+      'message' => TextChunkEvent(
+        content: json['content'],
+        isPartial: json['delta'] == true,
+        role: json['role'],
+        ...
+      ),
+      'tool_use' => ToolStartedEvent(
+        toolId: json['tool_id'],
+        toolName: json['tool_name'],
+        arguments: json['parameters'],
+        ...
+      ),
+      'tool_result' => ToolCompletedEvent(
+        toolId: json['tool_id'],
+        success: json['status'] == 'success',
+        result: json['output'],
+        error: json['error']?['message'],
+        ...
+      ),
+      // Legacy event types (still supported)
+      'content' => TextChunkEvent(content: json['value'], ...),
       'tool_call' => ToolStartedEvent(...),  // + implicit ToolCompletedEvent
-      'result' => SessionEndedEvent(...),
+      // Session lifecycle
+      'result' => SessionEndedEvent(
+        reason: json['status'] == 'success'
+          ? SessionEndReason.completed
+          : SessionEndReason.failed,
+        ...
+      ),
       'error' => SessionEndedEvent(reason: SessionEndReason.failed, ...),
+      'retry' => null,  // Informational, usually not translated
       _ => null,
     };
   }
@@ -1523,9 +1672,15 @@ class GeminiAdapter implements ProtocolAdapter {
 #### From Gemini CLI
 | Native Event | Unified Event(s) |
 |--------------|------------------|
-| (first event) | `SessionStartedEvent` (synthetic) |
-| `type: "content"` | `TextChunkEvent` |
-| `type: "tool_call"` | `ToolStartedEvent` + `ToolCompletedEvent` (atomic) |
+| `type: "init"` | `SessionStartedEvent` |
+| `type: "message"` (role: user) | (informational, not translated) |
+| `type: "message"` (role: assistant) | `TextChunkEvent` |
+| `type: "message"` (delta: true) | `TextChunkEvent` (isPartial: true) |
+| `type: "tool_use"` | `ToolStartedEvent` |
+| `type: "tool_result"` (success) | `ToolCompletedEvent` |
+| `type: "tool_result"` (error) | `ToolCompletedEvent` (success: false) |
+| `type: "content"` (legacy) | `TextChunkEvent` |
+| `type: "tool_call"` (legacy) | `ToolStartedEvent` + `ToolCompletedEvent` (atomic) |
 | `type: "result"` (success) | `TurnCompletedEvent` + `SessionEndedEvent(completed)` |
 | `type: "result"` (error) | `SessionEndedEvent(failed)` |
 | `type: "result"` (cancelled) | `SessionEndedEvent(cancelled)` |
@@ -1904,6 +2059,57 @@ class GeminiAdapter implements ProtocolAdapter {
   "title": "GeminiStreamEvent",
   "oneOf": [
     {
+      "description": "Session initialization event (first event emitted)",
+      "properties": {
+        "type": { "const": "init" },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "session_id": { "type": "string" },
+        "model": { "type": "string" }
+      },
+      "required": ["type", "session_id"]
+    },
+    {
+      "description": "User or assistant message",
+      "properties": {
+        "type": { "const": "message" },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "role": { "enum": ["user", "assistant"] },
+        "content": { "type": "string" },
+        "delta": { "type": "boolean" }
+      },
+      "required": ["type", "role", "content"]
+    },
+    {
+      "description": "Tool invocation request",
+      "properties": {
+        "type": { "const": "tool_use" },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "tool_name": { "type": "string" },
+        "tool_id": { "type": "string" },
+        "parameters": { "type": "object" }
+      },
+      "required": ["type", "tool_name", "tool_id"]
+    },
+    {
+      "description": "Tool execution result",
+      "properties": {
+        "type": { "const": "tool_result" },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "tool_id": { "type": "string" },
+        "status": { "enum": ["success", "error"] },
+        "output": { "type": "string" },
+        "error": {
+          "type": "object",
+          "properties": {
+            "type": { "type": "string" },
+            "message": { "type": "string" }
+          }
+        }
+      },
+      "required": ["type", "tool_id", "status"]
+    },
+    {
+      "description": "Text content (legacy format)",
       "properties": {
         "type": { "const": "content" },
         "value": { "type": "string" }
@@ -1911,6 +2117,7 @@ class GeminiAdapter implements ProtocolAdapter {
       "required": ["type", "value"]
     },
     {
+      "description": "Tool call (legacy format)",
       "properties": {
         "type": { "const": "tool_call" },
         "name": { "type": "string" },
@@ -1919,6 +2126,7 @@ class GeminiAdapter implements ProtocolAdapter {
       "required": ["type", "name", "args"]
     },
     {
+      "description": "Session completion",
       "properties": {
         "type": { "const": "result" },
         "status": { "enum": ["success", "error", "cancelled"] },
@@ -1938,6 +2146,7 @@ class GeminiAdapter implements ProtocolAdapter {
       "required": ["type", "status"]
     },
     {
+      "description": "Error event",
       "properties": {
         "type": { "const": "error" },
         "error": {
@@ -1951,6 +2160,7 @@ class GeminiAdapter implements ProtocolAdapter {
       "required": ["type", "error"]
     },
     {
+      "description": "Retry signal on transient failure",
       "properties": {
         "type": { "const": "retry" },
         "attempt": { "type": "integer" },
